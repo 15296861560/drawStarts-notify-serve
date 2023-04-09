@@ -5,41 +5,66 @@
  * @Autor: lgy
  * @Date: 2022-10-28 23:36:35
  * @LastEditors: “lgy lgy-lgy@qq.com
- * @LastEditTime: 2023-03-19 23:32:08
+ * @LastEditTime: 2023-04-09 16:14:17
  */
 const WebSocket = require('ws')
 import { mapToObject } from '../utils'
-import { SEND_TYPE, MSG_TYPE, WS_MSG_TYPE, METHOD_TYPE, NO_LOGIN_METHOD } from '../constant'
-import { WSRequest, Feedback, RequestFeedback, SystemMsg, Notify, NotifyClient, Channel } from '../interface'
-const port = 8030;
-
+import { SEND_TYPE, MSG_TYPE, WS_MSG_TYPE, METHOD_TYPE, NO_LOGIN_METHOD, DAY_DURATION } from '../constant'
+import { WSRequest, Feedback, RequestFeedback, SystemMsg, Notify, NotifyClient, Channel, ConnectInfo } from '../interface'
+import { ExternalInit } from '../interface/externalInterface'
+import { External } from "./external"
+import { verify } from 'crypto'
 
 export class NotifyServer {
+    private port: number;
+    private ext: External;
     private wsServer: any;
     private clientMap: Map<string, any>;
     private channelMap: Map<string, any>;
     constructor() {
-        this.wsServer = new WebSocket.Server({
-            port
-        }, () => {
-            console.log(`websocket run port ${port}`)
-        });
-
+        this.port = 8030;
+        this.ext = new External();
         this.clientMap = new Map();
         this.channelMap = new Map();
 
+    }
+
+    // 初始化
+    init(external?: ExternalInit) {
+        if (external) {
+            this.initExternal(external);
+        }
+        this.wsServer = new WebSocket.Server({
+            port: this.port
+        }, () => {
+            console.log(`websocket run port ${this.port}`)
+        });
+
         this.subscribeServer();
+    }
+
+    // 初始化外部方法
+    initExternal(external: ExternalInit) {
+        this.ext = new External(external);
+        if (external?.config?.port) {
+            this.port = external.config.port;
+        }
     }
 
     // 发布监听
     subscribeServer() {
         //每当有客户端链接的时候 就会有一个client对象
-        this.wsServer.on('connection', (client: any) => {
+        this.wsServer.on('connection', (client: any, req: any) => {
+
             //主动向前端发送消息
             client.on('message', (msg: string) => {
                 let msgObj = this.verifyMessageFormat(msg, client);
                 if (!msgObj) {
                     return;
+                }
+
+                if (msgObj.method && msgObj.method === METHOD_TYPE.login) {
+                    this.login(msgObj, client, req);
                 }
 
                 if (msgObj.type === SEND_TYPE.request) {
@@ -54,23 +79,28 @@ export class NotifyServer {
             client.on('close', (msg: any) => {
                 console.log('链接断开：', msg);
                 let clientId: string = '';
-                let channelMap: Map<string, any> = new Map();
                 this.clientMap.forEach((clientInstance: NotifyClient, clientId: string) => {
                     if (clientInstance.client === client) {
                         clientId = clientInstance.clientId;
-                        channelMap = clientInstance.channelMap;
                         return;
                     }
                 })
                 if (clientId) {
-                    // 清理客户端信息
-                    this.clientMap.delete(clientId);
-                    channelMap.forEach((channel: Channel, channelName: string) => {
-                        channel.clientMap.delete(clientId);
-                    })
+                    this.logout(clientId);
                 }
             })
         })
+    }
+
+    // 登出
+    logout(clientId: string) {
+        if (clientId) {
+            // 清理客户端信息
+            this.clientMap.delete(clientId);
+            this.channelMap.forEach((channel: Channel) => {
+                channel.clientMap.delete(clientId);
+            })
+        }
     }
 
     // 验证消息格式
@@ -93,17 +123,22 @@ export class NotifyServer {
     // 处理通知
     handleNotify(data: Notify) {
         let {
+            userId,
             notifyType,
             notifyMsg,
-            channelName
+            channelName,
+            clientId
         } = data;
 
         let notify: Notify = {
             type: WS_MSG_TYPE.notify,
             notifyType,
             notifyMsg,
-            channelName
+            channelName,
+            userId,
+            clientId
         }
+
         // 发送通知
         this.clientMap.forEach((clientInstance: NotifyClient) => {
             let {
@@ -121,27 +156,29 @@ export class NotifyServer {
             const notifyKey = `${notifyType}:${channelName}`;
             channel.notifyParamMap.set(notifyKey, notifyMsg);
         }
+        // 记录通知
+        this.ext.addNotify(data.userId, channelName, notifyType, notifyMsg)
     }
 
     // 处理请求
     handleRequest(data: WSRequest, client: any) {
         try {
-            if (data.method === METHOD_TYPE.login) {
-                this.login(data, client);
-            } else {
-                switch (data.method) {
-                    case METHOD_TYPE.joinChannel:
-                        this.joinChannel(data);
-                        break;
-                    case METHOD_TYPE.leaveChannel:
-                        this.leaveChannel(data);
-                        break;
-                    case METHOD_TYPE.getAttributes:
-                        this.getAttributes(data);
-                        break;
-                    default:
-                        break;
-                }
+            this.verifyTokenExpire(data);
+            switch (data.method) {
+                case METHOD_TYPE.joinChannel:
+                    this.joinChannel(data);
+                    break;
+                case METHOD_TYPE.leaveChannel:
+                    this.leaveChannel(data);
+                    break;
+                case METHOD_TYPE.getAttributes:
+                    this.getAttributes(data);
+                    break;
+                case METHOD_TYPE.logout:
+                    this.logout(data.clientId);
+                    break;
+                default:
+                    break;
             }
         } catch (e) {
             let resultStr: string = this.getFeedbackStr(false, {
@@ -169,29 +206,71 @@ export class NotifyServer {
         return JSON.stringify(feedback)
     }
 
+    // 验证token有效期
+    verifyTokenExpire(data: WSRequest) {
+        let clientInstance: NotifyClient = this.clientMap.get(data.clientId);
+        if (!clientInstance) {
+            throw ("not login...");
+        }
+        if (clientInstance.expireTime <= new Date().getTime()) {
+            this.logout(data.clientId);
+            throw ("token expire...");
+        }
+    }
+
     // 登录
-    login(data: any, client: any) {
-        if (data.token) {
-            let clientInstance:NotifyClient = {
+     login(data: any, client: any, req: any) {
+        if (!data.token) {
+            return;
+        }
+
+        try {
+            let userInfo: any = this.ext.verifyToken(data.token);
+            console.log('userInfo',userInfo);
+            console.log('userId',userInfo.userId ||userInfo.uid|| data.userId);
+            
+
+            const host = req.headers.host;
+            const origin = req.headers.origin;
+            const userAgent = req.headers['user-agent'];
+            const connectInfo: ConnectInfo = { host, origin, userAgent }
+
+            let clientInstance: NotifyClient = {
                 // 客户端id
                 clientId: data.clientId,
                 // 用户id
-                userId: data.userId,
+                userId: userInfo.userId ||userInfo.uid|| data.userId,
+                // 用户信息
+                userInfo,
+                // 连接信息
+                connectInfo,
                 // 加入的频道map
                 channelMap: new Map(),
                 // 登录时间
                 loginTime: new Date().getTime(),
+                // 过期时间
+                expireTime: userInfo.expireTime || (new Date().getTime() + DAY_DURATION),
                 // ws客户端
                 client
             }
             this.clientMap.set(data.clientId, clientInstance);
 
             let resultStr: string = this.getFeedbackStr(true, {
-                userId: data.userId,
+                userId: clientInstance.userId,
                 token: data.token
             }, METHOD_TYPE.login, data.requestId);
 
             client.send(resultStr);
+
+            const logContent = JSON.stringify({ userAgent });
+            this.ext.addLog('notify', host, origin, logContent);
+
+        } catch (e) {
+            let resultStr: string = this.getFeedbackStr(false, {
+                msg: e,
+                code: 400
+            }, "error", data.requestId);
+            client.send(resultStr)
         }
 
     }
@@ -200,7 +279,7 @@ export class NotifyServer {
     joinChannel(data: any) {
         const channelName = data.channelName;
 
-        let clientInstance:NotifyClient = this.clientMap.get(data.clientId);
+        let clientInstance: NotifyClient = this.clientMap.get(data.clientId);
         if (!clientInstance) {
             throw ("not login...");
         }
@@ -236,10 +315,10 @@ export class NotifyServer {
 
     // 离开频道
     leaveChannel(data: any) {
-        let clientInstance:NotifyClient = this.clientMap.get(data.clientId);
+        let clientInstance: NotifyClient = this.clientMap.get(data.clientId);
         clientInstance.channelMap.delete(data.channelName);
 
-        let channelInstance:Channel = this.channelMap.get(data.channelName);
+        let channelInstance: Channel = this.channelMap.get(data.channelName);
         channelInstance.clientMap.delete(data.clientId);
 
         let resultStr: string = this.getFeedbackStr(true, {
@@ -251,7 +330,7 @@ export class NotifyServer {
 
     // 获取属性
     getAttributes(data: any) {
-        let clientInstance:NotifyClient = this.clientMap.get(data.clientId);
+        let clientInstance: NotifyClient = this.clientMap.get(data.clientId);
 
         let resultStr: string = this.getFeedbackStr(true, {}, METHOD_TYPE.getAttributes, data.requestId);
 
@@ -259,7 +338,7 @@ export class NotifyServer {
     }
     // 获取某频道的属性
     getChannelAttribute(data: any) {
-        let clientInstance:NotifyClient = this.clientMap.get(data.clientId);
+        let clientInstance: NotifyClient = this.clientMap.get(data.clientId);
         const channelName = data.channelName;
         let attribute = {};
         let resultStr = '';

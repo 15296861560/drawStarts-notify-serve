@@ -2,8 +2,8 @@ export interface WSRequest {
     method?: string,
     type: string,
     sendTime?: number,
-    userId?: string,
-    clientId?: string,
+    userId: string,
+    clientId: string,
     requestId?: string,
 }
 
@@ -36,12 +36,24 @@ export interface NotifyClient {
     clientId: string,
     // 用户id
     userId: string,
+    // 用户信息
+    userInfo: any,
+    // 连接信息
+    connectInfo: ConnectInfo,
     // ws客户端
     client: any,
     // 加入的频道map
     channelMap: Map<string, any>,
     // 登录时间
     loginTime: number
+    // 过期时间
+    expireTime: number
+}
+
+export interface ConnectInfo {
+    host: string,
+    origin: string,
+    userAgent: string
 }
 
 export interface Channel {

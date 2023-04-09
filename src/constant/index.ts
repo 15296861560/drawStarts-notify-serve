@@ -35,3 +35,4 @@ export enum METHOD_TYPE {
 
 export const NO_LOGIN_METHOD = [String(METHOD_TYPE.login)];
 
+export const DAY_DURATION = 1000 * 60 * 60 * 24;
