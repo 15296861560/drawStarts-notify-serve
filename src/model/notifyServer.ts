@@ -1,362 +1,813 @@
+import WebSocket from 'ws'
+import http from 'http'
+import {
+  SEND_TYPE,
+  MSG_TYPE,
+  METHOD_TYPE,
+  NO_LOGIN_METHOD,
+  DAY_DURATION,
+  ERROR_CODE,
+  DEFAULT_CONFIG,
+  SYS_EVENT,
+} from '../constant'
+import {
+  WSRequest,
+  Notify,
+  NotifyClient,
+  ConnectInfo,
+  ServerNotifyOptions,
+} from '../interface'
+import { ExternalInit, ExternalConfig } from '../interface/externalInterface'
+import { StoredNotifyMessage } from '../interface/store'
+import { External } from '../adapters/external'
+import { createHttpAdminServer } from '../adapters/httpAdmin'
+import { SessionManager } from '../core/sessionManager'
+import { ChannelManager } from '../core/channelManager'
+import { RateLimiter } from '../core/rateLimiter'
+import { DeliveryService } from '../core/delivery'
+import { Metrics } from '../core/metrics'
+import { ProtocolError, toProtocolError } from '../protocol/errors'
+import { buildFeedback, buildSysMsg } from '../protocol/feedback'
+import { mapToObject, safeJsonParse, createLogger } from '../utils'
 
-/*
- * @Description: 
- * @Version: 2.0
- * @Autor: lgy
- * @Date: 2022-10-28 23:36:35
- * @LastEditors: “lgy lgy-lgy@qq.com
- * @LastEditTime: 2023-04-09 16:14:17
- */
-const WebSocket = require('ws')
-import { mapToObject } from '../utils'
-import { SEND_TYPE, MSG_TYPE, WS_MSG_TYPE, METHOD_TYPE, NO_LOGIN_METHOD, DAY_DURATION } from '../constant'
-import { WSRequest, Feedback, RequestFeedback, SystemMsg, Notify, NotifyClient, Channel, ConnectInfo } from '../interface'
-import { ExternalInit } from '../interface/externalInterface'
-import { External } from "./external"
-import { verify } from 'crypto'
+type RuntimeConfig = Required<ExternalConfig>
 
 export class NotifyServer {
-    private port: number;
-    private ext: External;
-    private wsServer: any;
-    private clientMap: Map<string, any>;
-    private channelMap: Map<string, any>;
-    constructor() {
-        this.port = 8030;
-        this.ext = new External();
-        this.clientMap = new Map();
-        this.channelMap = new Map();
+  private port: number
+  private ext: External
+  private wsServer: WebSocket.Server | null = null
+  private httpServer: http.Server | null = null
+  private sessions = new SessionManager()
+  private channels = new ChannelManager()
+  private delivery: DeliveryService
+  private rateLimiter: RateLimiter
+  private metrics = new Metrics()
+  private config: RuntimeConfig
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null
+  private log = createLogger()
 
+  constructor() {
+    this.config = { ...DEFAULT_CONFIG } as RuntimeConfig
+    this.port = this.config.port
+    this.ext = new External()
+    this.delivery = new DeliveryService(this.sessions, this.channels)
+    this.rateLimiter = new RateLimiter(
+      this.config.rateLimitWindowMs,
+      this.config.rateLimitMax
+    )
+  }
+
+  init(external?: ExternalInit) {
+    if (external) {
+      this.initExternal(external)
+    }
+    if (this.wsServer) {
+      throw new Error('NotifyServer already initialized')
     }
 
-    // 初始化
-    init(external?: ExternalInit) {
-        if (external) {
-            this.initExternal(external);
-        }
-        this.wsServer = new WebSocket.Server({
-            port: this.port
-        }, () => {
-            console.log(`websocket run port ${this.port}`)
-        });
+    this.wsServer = new WebSocket.Server({
+      port: this.port,
+      maxPayload: this.config.maxPayload,
+    })
 
-        this.subscribeServer();
+    this.wsServer.on('listening', () => {
+      this.log('info', `websocket listening on ${this.port}`)
+    })
+
+    this.subscribeServer()
+    this.startHeartbeatWatcher()
+    this.startHttpAdminIfNeeded()
+  }
+
+  initExternal(external: ExternalInit) {
+    this.ext = new External(external)
+    this.log = createLogger(external.logger)
+    this.applyConfig(external.config)
+    this.delivery.setMultiDevicePolicy(this.config.multiDevicePolicy)
+  }
+
+  /** 宿主主动推送（异步，需 await 以拿到投递结果） */
+  async notify(options: ServerNotifyOptions) {
+    return this.dispatchNotify({
+      ...options,
+      userId: options.userId || 'server',
+      clientId: options.clientId || 'server',
+      saveOffline: options.saveOffline !== false,
+    })
+  }
+
+  kick(clientId: string, reason = 'kicked by admin') {
+    const session = this.sessions.get(clientId)
+    if (!session) {
+      return false
+    }
+    this.safeSend(
+      session.client,
+      buildSysMsg(MSG_TYPE.single, SYS_EVENT.kicked, { reason, clientId })
+    )
+    try {
+      session.client.close(1008, reason)
+    } catch {
+      // ignore
+    }
+    this.removeClient(clientId, false)
+    return true
+  }
+
+  broadcastSys(event: string, data: any = {}) {
+    const msg = buildSysMsg(MSG_TYPE.all, event, data)
+    let count = 0
+    this.sessions.forEach((c) => {
+      if (this.safeSend(c.client, msg)) count += 1
+    })
+    return count
+  }
+
+  getStats() {
+    this.metrics.connections = this.sessions.size
+    this.metrics.channels = this.channels.size
+    return {
+      connections: this.sessions.size,
+      channels: this.channels.size,
+      port: this.port,
+      httpPort: this.config.httpPort,
+      enableOffline: this.config.enableOffline,
+    }
+  }
+
+  getMetrics() {
+    this.metrics.connections = this.sessions.size
+    this.metrics.channels = this.channels.size
+    return this.metrics.snapshot({ port: this.port, httpPort: this.config.httpPort })
+  }
+
+  async close() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer)
+      this.heartbeatTimer = null
+    }
+    try {
+      this.broadcastSys(SYS_EVENT.serverShutdown, { message: 'server shutting down' })
+    } catch {
+      // ignore
+    }
+    const clients = Array.from(this.sessions.values())
+    clients.forEach((c) => {
+      try {
+        c.client.terminate()
+      } catch {
+        // ignore
+      }
+      this.removeClient(c.clientId, false)
+    })
+
+    await new Promise<void>((resolve) => {
+      if (!this.wsServer) {
+        resolve()
+        return
+      }
+      this.wsServer.close(() => resolve())
+      // 防止 close 回调不触发
+      setTimeout(() => resolve(), 1000)
+    })
+    this.wsServer = null
+
+    await new Promise<void>((resolve) => {
+      if (!this.httpServer) {
+        resolve()
+        return
+      }
+      this.httpServer.close(() => resolve())
+      setTimeout(() => resolve(), 1000)
+    })
+    this.httpServer = null
+  }
+
+  private applyConfig(config?: ExternalConfig) {
+    if (!config) return
+    this.config = {
+      ...DEFAULT_CONFIG,
+      ...config,
+      allowedOrigins: config.allowedOrigins || DEFAULT_CONFIG.allowedOrigins,
+    } as RuntimeConfig
+    if (config.port) this.port = config.port
+    this.rateLimiter.update(this.config.rateLimitWindowMs, this.config.rateLimitMax)
+  }
+
+  private startHttpAdminIfNeeded() {
+    if (!this.config.httpPort || this.config.httpPort <= 0) {
+      return
+    }
+    this.httpServer = createHttpAdminServer({
+      getStats: () => this.getStats(),
+      getMetrics: () => this.getMetrics(),
+      notify: (body) => this.notify(body),
+      kick: (clientId, reason) => this.kick(clientId, reason),
+      broadcastSys: (event, data) => this.broadcastSys(event, data),
+      adminToken: this.config.adminToken,
+      logger: this.log,
+      staticDir: this.config.staticDir || undefined,
+    })
+    this.httpServer.listen(this.config.httpPort, () => {
+      this.log('info', `http admin listening on ${this.config.httpPort}`)
+    })
+  }
+
+  private subscribeServer() {
+    if (!this.wsServer) return
+
+    this.wsServer.on('connection', (client: WebSocket, req) => {
+      if (this.sessions.size >= this.config.maxConnections) {
+        client.close(1013, 'max connections')
+        return
+      }
+
+      const origin = String(req.headers.origin || '')
+      if (!this.isOriginAllowed(origin)) {
+        this.safeSend(
+          client,
+          buildFeedback(false, 'error', { msg: 'origin denied' }, '', ERROR_CODE.ORIGIN_DENIED, 'origin denied')
+        )
+        client.close(1008, 'origin denied')
+        return
+      }
+
+      client.on('message', (raw) => {
+        void this.onMessage(client, req, raw)
+      })
+
+      client.on('close', () => {
+        const session = this.sessions.findBySocket(client)
+        if (session) this.removeClient(session.clientId, false)
+      })
+
+      client.on('error', (err) => {
+        this.log('error', 'client error', { error: String(err) })
+      })
+    })
+  }
+
+  private async onMessage(client: WebSocket, req: any, raw: WebSocket.RawData) {
+    const size = Buffer.isBuffer(raw) ? raw.length : Buffer.byteLength(String(raw))
+    if (size > this.config.maxPayload) {
+      this.safeSend(
+        client,
+        buildFeedback(false, 'error', { msg: 'payload too large' }, '', ERROR_CODE.PAYLOAD_TOO_LARGE, 'payload too large')
+      )
+      return
     }
 
-    // 初始化外部方法
-    initExternal(external: ExternalInit) {
-        this.ext = new External(external);
-        if (external?.config?.port) {
-            this.port = external.config.port;
-        }
+    const msgObj = safeJsonParse(String(raw))
+    if (!msgObj) {
+      this.safeSend(
+        client,
+        buildFeedback(false, 'error', { msg: 'invalid json' }, '', ERROR_CODE.INVALID_PARAM, 'invalid json')
+      )
+      return
     }
 
-    // 发布监听
-    subscribeServer() {
-        //每当有客户端链接的时候 就会有一个client对象
-        this.wsServer.on('connection', (client: any, req: any) => {
-
-            //主动向前端发送消息
-            client.on('message', (msg: string) => {
-                let msgObj = this.verifyMessageFormat(msg, client);
-                if (!msgObj) {
-                    return;
-                }
-
-                if (msgObj.method && msgObj.method === METHOD_TYPE.login) {
-                    this.login(msgObj, client, req);
-                }
-
-                if (msgObj.type === SEND_TYPE.request) {
-                    this.handleRequest(msgObj, client);
-                }
-                if (msgObj.type === SEND_TYPE.notify) {
-                    this.handleNotify(msgObj);
-                }
-
-            })
-
-            client.on('close', (msg: any) => {
-                console.log('链接断开：', msg);
-                let clientId: string = '';
-                this.clientMap.forEach((clientInstance: NotifyClient, clientId: string) => {
-                    if (clientInstance.client === client) {
-                        clientId = clientInstance.clientId;
-                        return;
-                    }
-                })
-                if (clientId) {
-                    this.logout(clientId);
-                }
-            })
-        })
+    const rateKey = msgObj.clientId || req.socket?.remoteAddress || 'unknown'
+    if (!this.rateLimiter.check(rateKey)) {
+      this.safeSend(
+        client,
+        buildFeedback(false, 'error', { msg: 'rate limited' }, msgObj.requestId || '', ERROR_CODE.RATE_LIMITED, 'rate limited')
+      )
+      return
     }
 
-    // 登出
-    logout(clientId: string) {
-        if (clientId) {
-            // 清理客户端信息
-            this.clientMap.delete(clientId);
-            this.channelMap.forEach((channel: Channel) => {
-                channel.clientMap.delete(clientId);
-            })
-        }
+    try {
+      if (msgObj.method === METHOD_TYPE.login) {
+        await this.login(msgObj, client, req)
+        return
+      }
+      if (msgObj.type === SEND_TYPE.request) {
+        await this.handleRequest(msgObj, client)
+        return
+      }
+      if (msgObj.type === SEND_TYPE.notify) {
+        await this.handleNotify(msgObj as Notify, client)
+        return
+      }
+    } catch (e) {
+      const err = toProtocolError(e)
+      this.safeSend(
+        client,
+        buildFeedback(false, 'error', { msg: err.message, code: err.code }, msgObj.requestId || '', err.code, err.message)
+      )
+    }
+  }
+
+  private async handleRequest(data: WSRequest, client: WebSocket) {
+    const method = data.method || ''
+    try {
+      if (!NO_LOGIN_METHOD.includes(method)) {
+        this.verifySession(data.clientId)
+      } else if (method === METHOD_TYPE.heartbeat && data.clientId) {
+        this.sessions.touch(data.clientId)
+      }
+
+      switch (method) {
+        case METHOD_TYPE.heartbeat:
+          this.safeSend(
+            client,
+            buildFeedback(true, METHOD_TYPE.heartbeat, { ts: Date.now() }, data.requestId || '', ERROR_CODE.OK, 'ok')
+          )
+          break
+        case METHOD_TYPE.joinChannel:
+          this.joinChannel(data)
+          break
+        case METHOD_TYPE.leaveChannel:
+          this.leaveChannel(data)
+          break
+        case METHOD_TYPE.getAttributes:
+          this.getAttributes(data)
+          break
+        case METHOD_TYPE.getChannelAttribute:
+          this.getChannelAttribute(data)
+          break
+        case METHOD_TYPE.logout:
+          this.logoutWithFeedback(data)
+          break
+        case METHOD_TYPE.ack:
+          await this.handleAck(data, client)
+          break
+        case METHOD_TYPE.pullHistory:
+          await this.handlePullHistory(data, client)
+          break
+        case METHOD_TYPE.pullOffline:
+          await this.handlePullOffline(data, client)
+          break
+        default:
+          throw new ProtocolError(ERROR_CODE.INVALID_PARAM, `unknown method: ${method}`)
+      }
+    } catch (e) {
+      const err = toProtocolError(e)
+      if (err.code === ERROR_CODE.TOKEN_EXPIRE && data.clientId) {
+        this.sendSysToClient(data.clientId, SYS_EVENT.tokenExpire, { message: err.message })
+      }
+      this.safeSend(
+        client,
+        buildFeedback(false, method || 'error', { msg: err.message, code: err.code }, data.requestId || '', err.code, err.message)
+      )
+    }
+  }
+
+  private async handleNotify(data: Notify, client: WebSocket) {
+    try {
+      const session = this.verifySession(data.clientId)
+      if (!data.notifyType || data.notifyMsg === undefined) {
+        throw new ProtocolError(ERROR_CODE.INVALID_PARAM, 'notifyType/notifyMsg required')
+      }
+
+      const msgType = data.msgType || MSG_TYPE.channel
+      if (msgType === MSG_TYPE.channel && !data.channelName) {
+        throw new ProtocolError(ERROR_CODE.INVALID_PARAM, 'channelName required')
+      }
+      if (msgType === MSG_TYPE.channel && !session.channelMap.has(data.channelName)) {
+        throw new ProtocolError(ERROR_CODE.NO_PERMISSION, 'not joined channel')
+      }
+      if (msgType === MSG_TYPE.single && !data.targetUserId && !data.targetClientId) {
+        throw new ProtocolError(ERROR_CODE.INVALID_PARAM, 'targetUserId or targetClientId required')
+      }
+
+      const result = await this.dispatchNotify({
+        notifyType: data.notifyType,
+        notifyMsg: data.notifyMsg,
+        channelName: data.channelName,
+        msgType,
+        targetUserId: data.targetUserId,
+        targetClientId: data.targetClientId,
+        userId: session.userId,
+        clientId: session.clientId,
+        needAck: data.needAck ?? this.config.requireAck,
+        excludeSender: data.excludeSender,
+        saveOffline: true,
+      })
+
+      if (data.requestId) {
+        this.safeSend(
+          client,
+          buildFeedback(true, SEND_TYPE.notify, result, data.requestId, ERROR_CODE.OK, 'ok')
+        )
+      }
+    } catch (e) {
+      this.metrics.notifyFailed += 1
+      const err = toProtocolError(e)
+      this.safeSend(
+        client,
+        buildFeedback(
+          false,
+          SEND_TYPE.notify,
+          { msg: err.message, code: err.code },
+          data.requestId || '',
+          err.code,
+          err.message
+        )
+      )
+    }
+  }
+
+  private async dispatchNotify(options: ServerNotifyOptions & { saveOffline?: boolean }) {
+    const msgType = options.msgType || (options.channelName ? MSG_TYPE.channel : MSG_TYPE.single)
+    if (msgType === MSG_TYPE.channel && !options.channelName) {
+      throw new ProtocolError(ERROR_CODE.INVALID_PARAM, 'channelName required for channel notify')
     }
 
-    // 验证消息格式
-    verifyMessageFormat(msg: string, client: any) {
-        let msgObj = null;
-        try {
-            msgObj = JSON.parse(msg);
-            console.log('msgObj', msgObj);
-        } catch (e) {
-            let resultStr: string = this.getFeedbackStr(false, {
-                msg: "格式错误",
-                code: 400
-            }, "error");
-            client.send(resultStr)
-        }
+    this.metrics.notifySent += 1
+    const result = this.delivery.deliver({
+      ...options,
+      msgType,
+      needAck: options.needAck ?? this.config.requireAck,
+    })
+    this.metrics.notifyDelivered += result.delivered
 
-        return msgObj;
+    const stored: StoredNotifyMessage = {
+      messageId: result.messageId,
+      notifyType: options.notifyType,
+      notifyMsg: options.notifyMsg,
+      channelName: options.channelName,
+      msgType,
+      sendUserId: options.userId || 'server',
+      sendClientId: options.clientId,
+      targetUserId: options.targetUserId,
+      targetClientId: options.targetClientId,
+      createdAt: Date.now(),
+      ackedUserIds: [],
+      needAck: options.needAck ?? this.config.requireAck,
     }
 
-    // 处理通知
-    handleNotify(data: Notify) {
-        let {
-            userId,
-            notifyType,
-            notifyMsg,
-            channelName,
-            clientId
-        } = data;
-
-        let notify: Notify = {
-            type: WS_MSG_TYPE.notify,
-            notifyType,
-            notifyMsg,
-            channelName,
-            userId,
-            clientId
-        }
-
-        // 发送通知
-        this.clientMap.forEach((clientInstance: NotifyClient) => {
-            let {
-                channelMap,
-                client
-            } = clientInstance;
-
-            if (channelMap.get(channelName)) {
-                client.send(JSON.stringify(notify));
-            }
-        })
-        // 记录参数
-        let channel = this.channelMap.get(channelName);
-        if (channel) {
-            const notifyKey = `${notifyType}:${channelName}`;
-            channel.notifyParamMap.set(notifyKey, notifyMsg);
-        }
-        // 记录通知
-        this.ext.addNotify(data.userId, channelName, notifyType, notifyMsg)
+    const offlineFor: string[] = []
+    if (
+      msgType === MSG_TYPE.single &&
+      result.delivered === 0 &&
+      this.config.enableOffline &&
+      options.saveOffline !== false
+    ) {
+      const ids = Array.isArray(options.targetUserId)
+        ? options.targetUserId
+        : options.targetUserId
+          ? [String(options.targetUserId)]
+          : []
+      offlineFor.push(...ids)
+      result.offline = ids.length
+      this.metrics.offlineSaved += ids.length
     }
 
-    // 处理请求
-    handleRequest(data: WSRequest, client: any) {
-        try {
-            this.verifyTokenExpire(data);
-            switch (data.method) {
-                case METHOD_TYPE.joinChannel:
-                    this.joinChannel(data);
-                    break;
-                case METHOD_TYPE.leaveChannel:
-                    this.leaveChannel(data);
-                    break;
-                case METHOD_TYPE.getAttributes:
-                    this.getAttributes(data);
-                    break;
-                case METHOD_TYPE.logout:
-                    this.logout(data.clientId);
-                    break;
-                default:
-                    break;
-            }
-        } catch (e) {
-            let resultStr: string = this.getFeedbackStr(false, {
-                msg: e,
-                code: 400
-            }, "error", data.requestId);
-            client.send(resultStr)
-        }
+    // 频道消息落历史；单播在需 ACK 或离线时落库
+    const shouldPersist =
+      msgType !== MSG_TYPE.single ||
+      offlineFor.length > 0 ||
+      !!stored.needAck
 
+    if (shouldPersist) {
+      await Promise.resolve(this.ext.store.save(stored, offlineFor))
     }
 
-    // 获取反馈结果字符串
-    getFeedbackStr(status = false, data = {}, method = '', requestId = '') {
-        const requestFeedback: RequestFeedback = {
-            method,
-            status,
-            data
-        };
+    const receiveId =
+      msgType === MSG_TYPE.single
+        ? String(options.targetUserId || options.targetClientId || '')
+        : options.channelName || 'all'
 
-        const feedback: Feedback = {
-            type: WS_MSG_TYPE.feedback,
-            requestId,
-            res: requestFeedback
-        };
-        return JSON.stringify(feedback)
+    await Promise.resolve(
+      this.ext.addNotify(
+        options.userId || 'server',
+        receiveId,
+        options.notifyType,
+        options.notifyMsg,
+        result.messageId
+      )
+    )
+
+    return result
+  }
+
+  private async handleAck(data: WSRequest, client: WebSocket) {
+    const session = this.sessions.get(data.clientId)
+    if (!session) throw new ProtocolError(ERROR_CODE.NOT_LOGIN, 'not login')
+    if (!data.messageId) throw new ProtocolError(ERROR_CODE.INVALID_PARAM, 'messageId required')
+
+    const ok = await Promise.resolve(this.ext.store.ack(data.messageId, session.userId))
+    if (!ok) {
+      throw new ProtocolError(ERROR_CODE.MESSAGE_NOT_FOUND, 'message not found')
+    }
+    this.metrics.ackCount += 1
+    this.safeSend(
+      client,
+      buildFeedback(true, METHOD_TYPE.ack, { messageId: data.messageId }, data.requestId || '', ERROR_CODE.OK, 'ok')
+    )
+  }
+
+  private async handlePullHistory(data: WSRequest, client: WebSocket) {
+    const session = this.sessions.get(data.clientId)
+    if (!session) throw new ProtocolError(ERROR_CODE.NOT_LOGIN, 'not login')
+    const channelName = data.channelName || ''
+    if (!channelName) throw new ProtocolError(ERROR_CODE.INVALID_PARAM, 'channelName required')
+    if (!session.channelMap.has(channelName)) {
+      throw new ProtocolError(ERROR_CODE.NO_PERMISSION, 'not joined channel')
     }
 
-    // 验证token有效期
-    verifyTokenExpire(data: WSRequest) {
-        let clientInstance: NotifyClient = this.clientMap.get(data.clientId);
-        if (!clientInstance) {
-            throw ("not login...");
-        }
-        if (clientInstance.expireTime <= new Date().getTime()) {
-            this.logout(data.clientId);
-            throw ("token expire...");
-        }
+    const result = await Promise.resolve(
+      this.ext.store.listByChannel({
+        channelName,
+        cursor: data.cursor,
+        limit: data.limit || this.config.historyLimit,
+      })
+    )
+    this.safeSend(
+      client,
+      buildFeedback(true, METHOD_TYPE.pullHistory, result, data.requestId || '', ERROR_CODE.OK, 'ok')
+    )
+  }
+
+  private async handlePullOffline(data: WSRequest, client: WebSocket) {
+    const session = this.sessions.get(data.clientId)
+    if (!session) throw new ProtocolError(ERROR_CODE.NOT_LOGIN, 'not login')
+    if (!this.config.enableOffline) {
+      this.safeSend(
+        client,
+        buildFeedback(true, METHOD_TYPE.pullOffline, { list: [] }, data.requestId || '', ERROR_CODE.OK, 'ok')
+      )
+      return
     }
 
-    // 登录
-     login(data: any, client: any, req: any) {
-        if (!data.token) {
-            return;
-        }
+    const list = await Promise.resolve(
+      this.ext.store.listOffline(session.userId, data.limit || this.config.offlineLimit)
+    )
+    this.safeSend(
+      client,
+      buildFeedback(true, METHOD_TYPE.pullOffline, { list }, data.requestId || '', ERROR_CODE.OK, 'ok')
+    )
+  }
 
-        try {
-            let userInfo: any = this.ext.verifyToken(data.token);
-            console.log('userInfo',userInfo);
-            console.log('userId',userInfo.userId ||userInfo.uid|| data.userId);
-            
+  private async pushOfflineOnLogin(session: NotifyClient) {
+    if (!this.config.enableOffline) return
+    const list = await Promise.resolve(
+      this.ext.store.listOffline(session.userId, this.config.offlineLimit)
+    )
+    if (!list.length) return
 
-            const host = req.headers.host;
-            const origin = req.headers.origin;
-            const userAgent = req.headers['user-agent'];
-            const connectInfo: ConnectInfo = { host, origin, userAgent }
+    this.safeSend(
+      session.client,
+      buildSysMsg(MSG_TYPE.single, SYS_EVENT.offlineSync, { count: list.length })
+    )
 
-            let clientInstance: NotifyClient = {
-                // 客户端id
-                clientId: data.clientId,
-                // 用户id
-                userId: userInfo.userId ||userInfo.uid|| data.userId,
-                // 用户信息
-                userInfo,
-                // 连接信息
-                connectInfo,
-                // 加入的频道map
-                channelMap: new Map(),
-                // 登录时间
-                loginTime: new Date().getTime(),
-                // 过期时间
-                expireTime: userInfo.expireTime || (new Date().getTime() + DAY_DURATION),
-                // ws客户端
-                client
-            }
-            this.clientMap.set(data.clientId, clientInstance);
+    list.forEach((msg) => {
+      const payload: Notify = {
+        type: 'notify',
+        notifyType: msg.notifyType,
+        notifyMsg: msg.notifyMsg,
+        channelName: msg.channelName || '',
+        userId: msg.sendUserId,
+        clientId: msg.sendClientId || '',
+        msgType: msg.msgType,
+        messageId: msg.messageId,
+        needAck: msg.needAck,
+        createdAt: msg.createdAt,
+        targetUserId: msg.targetUserId,
+      }
+      this.safeSend(session.client, JSON.stringify(payload))
+      this.metrics.offlinePushed += 1
+    })
+  }
 
-            let resultStr: string = this.getFeedbackStr(true, {
-                userId: clientInstance.userId,
-                token: data.token
-            }, METHOD_TYPE.login, data.requestId);
-
-            client.send(resultStr);
-
-            const logContent = JSON.stringify({ userAgent });
-            this.ext.addLog('notify', host, origin, logContent);
-
-        } catch (e) {
-            let resultStr: string = this.getFeedbackStr(false, {
-                msg: e,
-                code: 400
-            }, "error", data.requestId);
-            client.send(resultStr)
-        }
-
+  private async login(data: any, client: WebSocket, req: any) {
+    if (!data.token) {
+      this.metrics.authFailed += 1
+      this.safeSend(
+        client,
+        buildFeedback(false, METHOD_TYPE.login, { msg: 'token required' }, data.requestId || '', ERROR_CODE.INVALID_PARAM, 'token required')
+      )
+      return
+    }
+    if (!data.clientId) {
+      this.metrics.authFailed += 1
+      this.safeSend(
+        client,
+        buildFeedback(false, METHOD_TYPE.login, { msg: 'clientId required' }, data.requestId || '', ERROR_CODE.INVALID_PARAM, 'clientId required')
+      )
+      return
     }
 
-    // 加入频道
-    joinChannel(data: any) {
-        const channelName = data.channelName;
+    try {
+      const userInfo = await Promise.resolve(this.ext.verifyToken(data.token))
+      const userId = userInfo?.userId || userInfo?.uid || data.userId
+      if (!userId) {
+        throw new ProtocolError(ERROR_CODE.INVALID_PARAM, 'userId missing from token')
+      }
 
-        let clientInstance: NotifyClient = this.clientMap.get(data.clientId);
-        if (!clientInstance) {
-            throw ("not login...");
-        }
-        let channel = {
-            channelName,
-            joinTime: new Date().getTime(),
-        }
-        clientInstance.channelMap.set(channelName, channel);
+      const host = String(req.headers.host || '')
+      const origin = String(req.headers.origin || '')
+      const userAgent = String(req.headers['user-agent'] || '')
+      const connectInfo: ConnectInfo = {
+        host,
+        origin,
+        userAgent,
+        remoteAddress: req.socket?.remoteAddress,
+      }
 
-        let channelInfo = this.channelMap.get(channelName);
-        if (!channelInfo) {
-            // 初始化频道信息
-            channelInfo = {
-                channelName,
-                createTime: new Date().getTime(),
-                notifyParamMap: new Map(),
-                clientMap: new Map([
-                    [clientInstance.clientId, clientInstance.client]
-                ])
-            }
-            this.channelMap.set(channelName, channelInfo);
-        } else {
-            channelInfo.clientMap.set(clientInstance.clientId, clientInstance.client)
-        }
+      const now = Date.now()
+      const clientInstance: NotifyClient = {
+        clientId: data.clientId,
+        userId,
+        userInfo: userInfo || {},
+        connectInfo,
+        channelMap: new Map(),
+        loginTime: now,
+        expireTime: userInfo?.expireTime || now + DAY_DURATION,
+        lastActiveTime: now,
+        client,
+      }
+      this.sessions.set(clientInstance)
 
-        let resultStr: string = this.getFeedbackStr(true, {
-            channelName
-        }, METHOD_TYPE.joinChannel, data.requestId);
+      this.safeSend(
+        client,
+        buildFeedback(
+          true,
+          METHOD_TYPE.login,
+          { userId, token: data.token, expireTime: clientInstance.expireTime },
+          data.requestId || '',
+          ERROR_CODE.OK,
+          'ok'
+        )
+      )
 
-        clientInstance.client.send(resultStr);
+      await Promise.resolve(
+        this.ext.addLog('notify', host, origin, JSON.stringify({ userAgent, userId }))
+      )
 
+      // 登录后补推离线
+      void this.pushOfflineOnLogin(clientInstance)
+    } catch (e) {
+      this.metrics.authFailed += 1
+      const err = toProtocolError(e)
+      this.safeSend(
+        client,
+        buildFeedback(false, METHOD_TYPE.login, { msg: err.message, code: err.code }, data.requestId || '', err.code, err.message)
+      )
     }
+  }
 
-    // 离开频道
-    leaveChannel(data: any) {
-        let clientInstance: NotifyClient = this.clientMap.get(data.clientId);
-        clientInstance.channelMap.delete(data.channelName);
+  private joinChannel(data: WSRequest) {
+    const channelName = data.channelName
+    if (!channelName) throw new ProtocolError(ERROR_CODE.INVALID_PARAM, 'channelName required')
+    const session = this.sessions.get(data.clientId)
+    if (!session) throw new ProtocolError(ERROR_CODE.NOT_LOGIN, 'not login')
+    this.channels.join(channelName, session)
+    this.safeSend(
+      session.client,
+      buildFeedback(true, METHOD_TYPE.joinChannel, { channelName }, data.requestId || '', ERROR_CODE.OK, 'ok')
+    )
+  }
 
-        let channelInstance: Channel = this.channelMap.get(data.channelName);
-        channelInstance.clientMap.delete(data.clientId);
+  private leaveChannel(data: WSRequest) {
+    const channelName = data.channelName
+    if (!channelName) throw new ProtocolError(ERROR_CODE.INVALID_PARAM, 'channelName required')
+    const session = this.sessions.get(data.clientId)
+    if (!session) throw new ProtocolError(ERROR_CODE.NOT_LOGIN, 'not login')
+    session.channelMap.delete(channelName)
+    this.channels.leave(channelName, data.clientId)
+    this.safeSend(
+      session.client,
+      buildFeedback(true, METHOD_TYPE.leaveChannel, { channelName }, data.requestId || '', ERROR_CODE.OK, 'ok')
+    )
+  }
 
-        let resultStr: string = this.getFeedbackStr(true, {
-            channelName: data.channelName
-        }, METHOD_TYPE.leaveChannel, data.requestId);
-
-        clientInstance.client.send(resultStr);
+  private getAttributes(data: WSRequest) {
+    const session = this.sessions.get(data.clientId)
+    if (!session) throw new ProtocolError(ERROR_CODE.NOT_LOGIN, 'not login')
+    const attribute = {
+      clientId: session.clientId,
+      userId: session.userId,
+      loginTime: session.loginTime,
+      expireTime: session.expireTime,
+      channels: Array.from(session.channelMap.keys()),
+      channelMap: mapToObject(session.channelMap),
     }
+    this.safeSend(
+      session.client,
+      buildFeedback(true, METHOD_TYPE.getAttributes, { attribute }, data.requestId || '', ERROR_CODE.OK, 'ok')
+    )
+  }
 
-    // 获取属性
-    getAttributes(data: any) {
-        let clientInstance: NotifyClient = this.clientMap.get(data.clientId);
-
-        let resultStr: string = this.getFeedbackStr(true, {}, METHOD_TYPE.getAttributes, data.requestId);
-
-        clientInstance.client.send(resultStr);
+  private getChannelAttribute(data: WSRequest) {
+    const session = this.sessions.get(data.clientId)
+    if (!session) throw new ProtocolError(ERROR_CODE.NOT_LOGIN, 'not login')
+    const channelName = data.channelName || ''
+    if (!channelName) throw new ProtocolError(ERROR_CODE.INVALID_PARAM, 'channelName required')
+    if (!session.channelMap.has(channelName)) {
+      this.safeSend(
+        session.client,
+        buildFeedback(
+          false,
+          METHOD_TYPE.getChannelAttribute,
+          { msg: 'not joined channel', code: ERROR_CODE.NO_PERMISSION },
+          data.requestId || '',
+          ERROR_CODE.NO_PERMISSION,
+          'not joined channel'
+        )
+      )
+      return
     }
-    // 获取某频道的属性
-    getChannelAttribute(data: any) {
-        let clientInstance: NotifyClient = this.clientMap.get(data.clientId);
-        const channelName = data.channelName;
-        let attribute = {};
-        let resultStr = '';
-        if (clientInstance.channelMap.get(channelName)) {
-            let channel = this.channelMap.get(channelName);
-            attribute = mapToObject(channel.notifyParamMap);
-            resultStr = this.getFeedbackStr(true, {
-                channelName,
-                attribute
-            }, METHOD_TYPE.getChannelAttribute, data.requestId);
-        } else {
-            resultStr = this.getFeedbackStr(false, {
-                msg: "当前客户端未加入该频道",
-                code: 403
-            }, METHOD_TYPE.getChannelAttribute, data.requestId);
+    if (!this.channels.get(channelName)) {
+      throw new ProtocolError(ERROR_CODE.CHANNEL_NOT_FOUND, 'channel not found')
+    }
+    const attribute = this.channels.getNotifyAttributes(channelName)
+    this.safeSend(
+      session.client,
+      buildFeedback(
+        true,
+        METHOD_TYPE.getChannelAttribute,
+        { channelName, attribute },
+        data.requestId || '',
+        ERROR_CODE.OK,
+        'ok'
+      )
+    )
+  }
+
+  private logoutWithFeedback(data: WSRequest) {
+    const session = this.sessions.get(data.clientId)
+    if (session) {
+      this.safeSend(
+        session.client,
+        buildFeedback(true, METHOD_TYPE.logout, {}, data.requestId || '', ERROR_CODE.OK, 'ok')
+      )
+    }
+    this.removeClient(data.clientId, false)
+  }
+
+  private verifySession(clientId: string): NotifyClient {
+    if (!clientId) throw new ProtocolError(ERROR_CODE.INVALID_PARAM, 'clientId required')
+    const session = this.sessions.get(clientId)
+    if (!session) throw new ProtocolError(ERROR_CODE.NOT_LOGIN, 'not login')
+    if (session.expireTime <= Date.now()) {
+      this.removeClient(clientId, true)
+      throw new ProtocolError(ERROR_CODE.TOKEN_EXPIRE, 'token expire')
+    }
+    session.lastActiveTime = Date.now()
+    return session
+  }
+
+  private removeClient(clientId: string, notifyExpire: boolean) {
+    const session = this.sessions.get(clientId)
+    if (!session) return
+    if (notifyExpire) {
+      this.safeSend(
+        session.client,
+        buildSysMsg(MSG_TYPE.single, SYS_EVENT.tokenExpire, { clientId })
+      )
+    }
+    this.channels.leaveAll(session)
+    this.sessions.delete(clientId)
+    this.rateLimiter.clear(clientId)
+  }
+
+  private sendSysToClient(clientId: string, event: string, data: any) {
+    const session = this.sessions.get(clientId)
+    if (!session) return
+    this.safeSend(session.client, buildSysMsg(MSG_TYPE.single, event, data))
+  }
+
+  private startHeartbeatWatcher() {
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
+    this.heartbeatTimer = setInterval(() => {
+      const now = Date.now()
+      const timeout = this.config.heartbeatTimeout
+      const expired: string[] = []
+      this.sessions.forEach((session) => {
+        if (session.expireTime <= now) {
+          expired.push(session.clientId)
+          return
         }
+        if (now - session.lastActiveTime > timeout) {
+          try {
+            session.client.close(1001, 'heartbeat timeout')
+          } catch {
+            // ignore
+          }
+          expired.push(session.clientId)
+        }
+      })
+      expired.forEach((id) => this.removeClient(id, true))
+    }, this.config.heartbeatInterval)
+  }
 
-        clientInstance.client.send(resultStr);
+  private isOriginAllowed(origin: string) {
+    const list = this.config.allowedOrigins
+    if (!list || list.length === 0) return true
+    if (!origin) return false
+    return list.includes(origin)
+  }
+
+  private safeSend(socket: any, data: string) {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      try {
+        socket.send(data)
+        return true
+      } catch (e) {
+        this.log('error', 'send failed', { error: String(e) })
+      }
     }
-
+    return false
+  }
 }

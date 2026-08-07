@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>消息通知系统 · 联调 Demo</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --line: #2d3a4f;
+      --text: #e7ecf3;
+      --muted: #8b9bb4;
+      --accent: #3d9cf0;
+      --ok: #3ecf8e;
+      --warn: #f0b429;
+      --err: #f07178;
+      --font: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--font);
+      background: radial-gradient(1200px 600px at 10% -10%, #1b2a44, transparent),
+                  radial-gradient(900px 500px at 100% 0%, #1a332a, transparent),
+                  var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    header {
+      padding: 20px 24px 8px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      align-items: end;
+      justify-content: space-between;
+    }
+    h1 { margin: 0; font-size: 20px; letter-spacing: 0.02em; }
+    .sub { color: var(--muted); font-size: 13px; margin-top: 4px; }
+    .cfg {
+      display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+    }
+    input, select, button, textarea {
+      font: inherit;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #121a26;
+      color: var(--text);
+      padding: 8px 10px;
+    }
+    input { min-width: 160px; }
+    button {
+      background: linear-gradient(180deg, #2f6fad, #255a8c);
+      border-color: #3d7eb8;
+      cursor: pointer;
+    }
+    button.secondary { background: #243044; border-color: var(--line); }
+    button.danger { background: #8c2f3a; border-color: #a94350; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    main {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      padding: 16px 24px 24px;
+    }
+    @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+    .card {
+      background: color-mix(in srgb, var(--panel) 92%, black);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      min-height: 620px;
+    }
+    .card-h {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+    .badge {
+      font-size: 12px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: #243044;
+      color: var(--muted);
+    }
+    .badge.on { background: rgba(62, 207, 142, 0.15); color: var(--ok); }
+    .badge.off { background: rgba(240, 113, 120, 0.12); color: var(--err); }
+    .body { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; flex: 1; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    .row > * { flex: 1; min-width: 110px; }
+    .row button { flex: 0 0 auto; }
+    label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 4px; }
+    .field { flex: 1; min-width: 120px; }
+    .log {
+      flex: 1;
+      min-height: 260px;
+      overflow: auto;
+      background: #0d121a;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px;
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .log .t { color: var(--muted); margin-right: 6px; }
+    .log .ok { color: var(--ok); }
+    .log .err { color: var(--err); }
+    .log .sys { color: var(--warn); }
+    .log .msg { color: var(--accent); }
+    .admin {
+      margin: 0 24px 24px;
+      padding: 14px;
+      border: 1px dashed var(--line);
+      border-radius: 12px;
+      background: rgba(26, 35, 50, 0.6);
+    }
+    .admin h2 { margin: 0 0 10px; font-size: 15px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>消息通知系统 · 联调 Demo</h1>
+      <div class="sub">双客户端模拟 · 频道/单播/离线/ACK/历史 · HTTP 管理面</div>
+    </div>
+    <div class="cfg">
+      <div class="field">
+        <label>WS 地址</label>
+        <input id="wsUrl" value="ws://127.0.0.1:8030" />
+      </div>
+      <div class="field">
+        <label>HTTP 管理</label>
+        <input id="httpUrl" value="http://127.0.0.1:8031" />
+      </div>
+      <div class="field">
+        <label>Admin Token</label>
+        <input id="adminToken" value="demo-admin" />
+      </div>
+      <button class="secondary" id="btnHealth">Health</button>
+      <button class="secondary" id="btnMetrics">Metrics</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="card" id="panelA"></section>
+    <section class="card" id="panelB"></section>
+  </main>
+
+  <section class="admin">
+    <h2>服务端管理（HTTP）</h2>
+    <div class="row">
+      <div class="field">
+        <label>notifyType</label>
+        <input id="admType" value="server-push" />
+      </div>
+      <div class="field">
+        <label>channel / targetUserId</label>
+        <input id="admTarget" value="room-demo" />
+      </div>
+      <div class="field">
+        <label>msgType</label>
+        <select id="admMsgType">
+          <option value="channel">channel</option>
+          <option value="single">single</option>
+          <option value="all">all</option>
+        </select>
+      </div>
+      <div class="field" style="flex:2">
+        <label>notifyMsg (JSON string)</label>
+        <input id="admMsg" value='{"hello":"from-admin"}' />
+      </div>
+      <button id="btnAdminNotify">Admin Notify</button>
+      <button class="secondary" id="btnBroadcast">Broadcast Sys</button>
+    </div>
+  </section>
+
+  <script>
+    function el(tag, attrs = {}, children = []) {
+      const node = document.createElement(tag)
+      Object.entries(attrs).forEach(([k, v]) => {
+        if (k === 'className') node.className = v
+        else if (k === 'text') node.textContent = v
+        else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2).toLowerCase(), v)
+        else node.setAttribute(k, v)
+      })
+      children.forEach((c) => node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c))
+      return node
+    }
+
+    function createClientPanel(root, defaults) {
+      const state = {
+        name: defaults.name,
+        token: defaults.token,
+        ws: null,
+        clientId: '',
+        userId: '',
+        ready: false,
+        login: false,
+      }
+
+      const status = el('span', { className: 'badge off', text: '未连接' })
+      const logBox = el('div', { className: 'log' })
+
+      const tokenInput = el('input', { value: defaults.token })
+      const channelInput = el('input', { value: 'room-demo' })
+      const notifyTypeInput = el('input', { value: 'chat' })
+      const notifyMsgInput = el('input', { value: '{"text":"hello"}' })
+      const targetUserInput = el('input', { value: defaults.peerUserId, placeholder: 'targetUserId' })
+      const msgTypeSelect = el('select', {}, [
+        el('option', { value: 'channel', text: 'channel' }),
+        el('option', { value: 'single', text: 'single' }),
+      ])
+
+      function log(type, text, cls = '') {
+        const line = el('div', {})
+        line.innerHTML = `<span class="t">${new Date().toLocaleTimeString()}</span><span class="${cls}">[${type}]</span> ${escapeHtml(text)}`
+        logBox.appendChild(line)
+        logBox.scrollTop = logBox.scrollHeight
+      }
+
+      function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+      }
+
+      function setStatus() {
+        if (state.login) {
+          status.className = 'badge on'
+          status.textContent = `已登录 ${state.userId}`
+        } else if (state.ready) {
+          status.className = 'badge'
+          status.textContent = '已连接'
+        } else {
+          status.className = 'badge off'
+          status.textContent = '未连接'
+        }
+      }
+
+      function send(obj) {
+        if (!state.ws || state.ws.readyState !== 1) {
+          log('err', 'socket not ready', 'err')
+          return
+        }
+        const payload = {
+          ...obj,
+          clientId: state.clientId,
+          userId: state.userId || obj.userId,
+          sendTime: Date.now(),
+        }
+        if (!payload.requestId && (payload.type === 'request' || payload.method)) {
+          payload.requestId = `${state.clientId}-${payload.method || payload.type}-${Date.now()}`
+        }
+        state.ws.send(JSON.stringify(payload))
+        log('send', JSON.stringify(payload))
+      }
+
+      function connect() {
+        if (state.ws) {
+          try { state.ws.close() } catch {}
+        }
+        state.clientId = 'c_' + Math.random().toString(16).slice(2, 10)
+        const url = document.getElementById('wsUrl').value.trim()
+        state.ws = new WebSocket(url)
+        state.ws.onopen = () => {
+          state.ready = true
+          setStatus()
+          log('sys', 'ws open', 'sys')
+        }
+        state.ws.onclose = () => {
+          state.ready = false
+          state.login = false
+          setStatus()
+          log('sys', 'ws close', 'sys')
+        }
+        state.ws.onerror = () => log('err', 'ws error', 'err')
+        state.ws.onmessage = (ev) => {
+          let data
+          try { data = JSON.parse(ev.data) } catch { log('err', ev.data, 'err'); return }
+          if (data.type === 'feedback') {
+            const ok = data.res?.status
+            log('feedback', JSON.stringify(data.res), ok ? 'ok' : 'err')
+            if (data.res?.method === 'login' && ok) {
+              state.login = true
+              state.userId = data.res.data.userId
+              setStatus()
+            }
+            if (data.res?.method === 'logout' && ok) {
+              state.login = false
+              state.userId = ''
+              setStatus()
+            }
+          } else if (data.type === 'notify') {
+            log('notify', JSON.stringify(data), 'msg')
+            if (data.needAck && data.messageId) {
+              send({ type: 'request', method: 'ack', messageId: data.messageId })
+            }
+          } else if (data.type === 'sys') {
+            log('sys', `${data.event || ''} ${JSON.stringify(data.data || {})}`, 'sys')
+          } else {
+            log('raw', JSON.stringify(data))
+          }
+        }
+      }
+
+      root.append(
+        el('div', { className: 'card-h' }, [
+          el('strong', { text: defaults.name }),
+          status,
+        ]),
+        el('div', { className: 'body' }, [
+          el('div', { className: 'row' }, [
+            el('div', { className: 'field' }, [el('label', { text: 'Token (= userId)' }), tokenInput]),
+            el('button', { text: '连接', onClick: connect }),
+            el('button', {
+              text: '登录',
+              onClick: () => send({ type: 'request', method: 'login', token: tokenInput.value.trim() }),
+            }),
+            el('button', {
+              className: 'secondary',
+              text: '登出',
+              onClick: () => send({ type: 'request', method: 'logout' }),
+            }),
+          ]),
+          el('div', { className: 'row' }, [
+            el('div', { className: 'field' }, [el('label', { text: '频道' }), channelInput]),
+            el('button', {
+              text: '加入',
+              onClick: () => send({ type: 'request', method: 'joinChannel', channelName: channelInput.value.trim() }),
+            }),
+            el('button', {
+              className: 'secondary',
+              text: '离开',
+              onClick: () => send({ type: 'request', method: 'leaveChannel', channelName: channelInput.value.trim() }),
+            }),
+            el('button', {
+              className: 'secondary',
+              text: '历史',
+              onClick: () => send({ type: 'request', method: 'pullHistory', channelName: channelInput.value.trim(), limit: 20 }),
+            }),
+            el('button', {
+              className: 'secondary',
+              text: '离线箱',
+              onClick: () => send({ type: 'request', method: 'pullOffline', limit: 20 }),
+            }),
+          ]),
+          el('div', { className: 'row' }, [
+            el('div', { className: 'field' }, [el('label', { text: 'notifyType' }), notifyTypeInput]),
+            el('div', { className: 'field' }, [el('label', { text: 'msgType' }), msgTypeSelect]),
+            el('div', { className: 'field' }, [el('label', { text: 'targetUserId' }), targetUserInput]),
+          ]),
+          el('div', { className: 'row' }, [
+            el('div', { className: 'field', style: 'flex:2' }, [el('label', { text: 'notifyMsg' }), notifyMsgInput]),
+            el('button', {
+              text: '发送通知',
+              onClick: () => {
+                const msgType = msgTypeSelect.value
+                const payload = {
+                  type: 'notify',
+                  notifyType: notifyTypeInput.value.trim(),
+                  notifyMsg: notifyMsgInput.value,
+                  msgType,
+                  needAck: true,
+                  requestId: `${state.clientId}-notify-${Date.now()}`,
+                }
+                if (msgType === 'channel') payload.channelName = channelInput.value.trim()
+                if (msgType === 'single') payload.targetUserId = targetUserInput.value.trim()
+                send(payload)
+              },
+            }),
+            el('button', {
+              className: 'secondary',
+              text: 'Heartbeat',
+              onClick: () => send({ type: 'request', method: 'heartbeat' }),
+            }),
+            el('button', {
+              className: 'secondary',
+              text: '清空日志',
+              onClick: () => { logBox.innerHTML = '' },
+            }),
+          ]),
+          logBox,
+        ])
+      )
+
+      return state
+    }
+
+    createClientPanel(document.getElementById('panelA'), {
+      name: '客户端 A · alice',
+      token: 'alice',
+      peerUserId: 'bob',
+    })
+    createClientPanel(document.getElementById('panelB'), {
+      name: '客户端 B · bob',
+      token: 'bob',
+      peerUserId: 'alice',
+    })
+
+    async function adminFetch(path, body) {
+      const base = document.getElementById('httpUrl').value.replace(/\/$/, '')
+      const token = document.getElementById('adminToken').value
+      const res = await fetch(base + path, {
+        method: body ? 'POST' : 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Admin-Token': token,
+        },
+        body: body ? JSON.stringify(body) : undefined,
+      })
+      const data = await res.json()
+      alert(JSON.stringify(data, null, 2))
+    }
+
+    document.getElementById('btnHealth').onclick = () => adminFetch('/health')
+    document.getElementById('btnMetrics').onclick = () => adminFetch('/metrics')
+    document.getElementById('btnAdminNotify').onclick = () => {
+      const msgType = document.getElementById('admMsgType').value
+      const target = document.getElementById('admTarget').value.trim()
+      const body = {
+        notifyType: document.getElementById('admType').value.trim(),
+        notifyMsg: document.getElementById('admMsg').value,
+        msgType,
+        needAck: true,
+      }
+      if (msgType === 'channel') body.channelName = target
+      if (msgType === 'single') body.targetUserId = target
+      adminFetch('/admin/notify', body)
+    }
+    document.getElementById('btnBroadcast').onclick = () =>
+      adminFetch('/admin/broadcast', { event: 'notice', data: { text: 'hello everyone' } })
+  </script>
+</body>
+</html>

@@ -1,23 +1,32 @@
 {
   "name": "drawstarts-notify-serve",
-  "version": "0.0.4",
+  "version": "0.2.0",
   "private": false,
-  "main": "dist/draw-starts-notify-serve.umd.js",
+  "main": "dist/draw-starts-notify-serve.cjs.js",
+  "module": "dist/draw-starts-notify-serve.es.js",
+  "types": "src/main.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/draw-starts-notify-serve.es.js",
+      "require": "./dist/draw-starts-notify-serve.cjs.js"
+    }
+  },
   "author": "lgy-lgy",
   "scripts": {
     "build": "vite build",
-    "test": "node test/index.ts"
+    "test": "npm run build && node test/index.js",
+    "test:accept": "npm run build && node test/acceptance.js",
+    "demo": "npm run build && node demo/standalone.js"
   },
   "dependencies": {
-    "lodash": "^4.17.21",
     "ws": "^8.10.0"
   },
   "engines": {
-    "node": ">= 6.0.0",
-    "npm": ">= 3.0.0"
+    "node": ">=16.0.0"
   },
   "devDependencies": {
     "@types/node": "^18.15.3",
+    "@types/ws": "^8.5.10",
     "typescript": "^4.5.4",
     "vite": "^2.8.0"
   }
